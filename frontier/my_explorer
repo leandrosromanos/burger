@@ -14,4 +14,56 @@ class Explorer(Node): #dimiourgia komvou
             10
         )
 
-        self.get_logger().info('Περιμένω χάρτη...')
+        self.get_logger().info('Waiting for map...')
+
+        total_cells = len(msg.data)
+
+        unknown_cells = 0
+
+        for value in msg.data:
+            if value == -1:
+                unknown_cells += 1
+
+        known_cells = total_cells - unknown_cells
+
+        self.get_logger().info(
+            f'Total cells: {total_cells} | '
+            f'Known: {known_cells} | '
+            f'Unknown: {unknown_cells}'
+        )
+
+        def map_callback(self, msg):
+            width = msg.info.width
+            height = msg.info.height
+            resolution = msg.info.resolution
+
+            width_meters = width * resolution
+            height_meters = height * resolution
+
+            self.get_logger().info(
+                f'Map: {width} × {height} κελιά | '
+                f'Resolution: {resolution:.3f} m/κελί | '
+                f'Dimentions: {width_meters:.2f} × {height_meters:.2f} m'
+            )
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = Explorer()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        node.destroy_node()
+
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
