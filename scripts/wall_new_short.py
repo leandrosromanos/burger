@@ -1,8 +1,9 @@
-"""TurtleBot3 ROS 2 Jazzy heuristic right-wall coverage.
+"""TurtleBot3 Burger / ROS 2 Jazzy: cautious rolling right-corner recovery.
 
-Uses /scan and /odom; does not identify the outer boundary or prove coverage.
-Default /cmd_vel type is TwistStamped: verify with `ros2 topic info /cmd_vel -v`.
+Heuristic only: scan line segments are not guaranteed to be outer walls.
+Uses /scan, /odom and TwistStamped /cmd_vel. Check topic type before use.
 """
+
 import math
 import time
 from collections import deque
@@ -31,7 +32,12 @@ class WallCoverage(Node):
         self.forward_speed = 0.075
         self.slow_speed = 0.040
         self.avoid_turn_speed = 0.24
-        self.corner_turn_speed = 0.16
+        self.corner_turn_speed = 0.20
+        self.corner_creep_speed = 0.025  # forward arc only if LiDAR clearance permits
+        self.avoid_creep_speed = 0.020   # shallow left arc, only in a clear corridor
+        self.corner_forward_clearance = 0.40
+        self.corner_front_right_clearance = 0.32
+        self.corner_side_clearance = 0.24
         self.front_stop = 0.29
         self.front_resume = 0.37
         self.front_right_stop = 0.23
@@ -42,7 +48,7 @@ class WallCoverage(Node):
         self.heading_kp = 0.35
         self.max_right_steer = 0.22
         self.max_left_steer = 0.18
-        self.first_wall_distance = 0.36
+        self.first_wall_distance = 0.30
         self.wall_acquire_range = 0.70
         self.wall_range_extra = 0.70
 
@@ -62,14 +68,21 @@ class WallCoverage(Node):
 
         # Right-hand corner and escape rules.
         self.corner_grace = 0.5
-        self.corner_timeout = 10.0   # requested 10-second recovery limit
-        self.avoid_timeout = 10.0    # requested 10-second avoidance limit
+        self.corner_timeout = 25.0  # allow time to round short/interrupted walls
+        self.avoid_timeout = 10.0   # keep individual obstacle-avoidance safety limit
+        self.recovery_search_timeout = 15.0  # after corner timeout, search forward gently
+        self.recovery_search_speed = 0.030
+        self.max_recovery_failures = 2  # stop only after repeated unsuccessful recoveries
+        self.recovery_failure_window = 120.0
         self.corner_reacquire_angle = math.radians(35)
         self.corner_confirm_ticks = 3
         self.settle_time = 1.5
         self.settle_max_steer = 0.10
-        self.max_corner_attempts = 3
+        self.max_corner_attempts = 3  # retained for compatibility; no count-based stop
         self.corner_attempt_window = 30.0
+        self.recovery_started = None  # continuous wall-recovery budget across avoidance
+        self.wall_stable_since = None
+        self.recovery_reset_seconds = 2.0
 
         # Gradually increase clearance between odometry-detected laps.
         self.inward_step = 0.20
@@ -104,7 +117,8 @@ class WallCoverage(Node):
         self.avoid_started = None
         self.reacquire_ticks = 0
         self.last_corner_recovery = None
-        self.corner_attempts = deque()
+        self.corner_attempts = deque()  # failed recovery episodes within window
+        self.recovery_search_started = None
         self.recent_path = deque(maxlen=250)
         self.lap_count = 0
         self.lap_origin = None
@@ -121,7 +135,7 @@ class WallCoverage(Node):
                                  qos_profile_sensor_data)
         self.cmd_pub = self.create_publisher(TwistStamped, '/cmd_vel', 10)
         self.create_timer(0.1, self.control)
-        self.get_logger().info('Wall coverage ready (10-second recovery limits).')
+        self.get_logger().info('Wall coverage ready: rolling corners, 25s recovery + 15s cautious search.')
 
     @staticmethod
     def sector(scan, low, high):
@@ -314,18 +328,57 @@ class WallCoverage(Node):
         self.move(0, self.avoid_turn_speed)
 
     def start_corner(self, now):
-        while self.corner_attempts and now - self.corner_attempts[0] > self.corner_attempt_window:
-            self.corner_attempts.popleft()
-        self.corner_attempts.append(now)
-        if len(self.corner_attempts) > self.max_corner_attempts:
-            self.finish('STOP: repeated corner attempts')
-            return
+        # One continuous recovery episode. Left avoidance does not reset its clock,
+        # preventing repeated corner/avoid transitions from continuing forever.
+        if self.recovery_started is None:
+            self.recovery_started = now
         self.state = 'CORNER_RIGHT'
         self.corner_started = now
         self.reacquire_ticks = 0
+        self.wall_stable_since = None
         self.recent_path.clear()
-        self.get_logger().info('CORNER_RIGHT: right wall missing')
-        self.move(0, -self.corner_turn_speed)
+        self.get_logger().info('CORNER_RIGHT: wall lost, trying slow right arc')
+        self.corner_motion()
+
+    def begin_recovery_search(self, now):
+        """Do not stop just because a corner could not be matched in time.
+
+        Travel slowly in the current heading while looking for a confirmed
+        right-side wall. If the way is blocked, AVOID_LEFT has priority.
+        """
+        self.state = 'RECOVER_SEARCH'
+        self.recovery_search_started = now
+        self.corner_started = None
+        self.wall_missing_since = None
+        self.reacquire_ticks = 0
+        self.get_logger().warning(
+            'Wall still missing: slow forward search instead of stopping')
+        self.move(0, 0)
+
+    def recovery_failed(self, now):
+        """Bound repeated unsuccessful recovery rather than circling forever."""
+        self.corner_attempts.append(now)
+        while (self.corner_attempts and
+               now - self.corner_attempts[0] > self.recovery_failure_window):
+            self.corner_attempts.popleft()
+        if len(self.corner_attempts) >= self.max_recovery_failures:
+            self.finish('STOP: repeated wall recovery failures; check the environment')
+            return
+        # One bounded second chance, starting with a slow forward search.
+        self.recovery_started = None
+        self.begin_recovery_search(now)
+
+    def corner_motion(self):
+        # A right arc is allowed only with generous FRONT, FRONT-RIGHT and
+        # RIGHT clearances. Otherwise rotate in place, or let safety stop us.
+        safe_arc = (self.front >= self.corner_forward_clearance and
+                    self.front_right >= self.corner_front_right_clearance and
+                    self.right_near is not None and
+                    self.right_near >= self.corner_side_clearance)
+        if safe_arc:
+            self.move(self.corner_creep_speed, -self.corner_turn_speed)
+        else:
+            self.move(0, -self.corner_turn_speed)
 
     def control(self):
         if self.state == 'DONE':
@@ -344,6 +397,18 @@ class WallCoverage(Node):
         wall_seen = (wall is not None and wall[0] <=
                      max(self.wall_acquire_range, self.active_distance + self.wall_range_extra))
 
+        # Recovery can span AVOID_LEFT; a timeout does not immediately stop.
+        # A frontal obstacle is still handled by the avoidance state.
+        if (self.recovery_started is not None and
+                now - self.recovery_started >= self.corner_timeout and
+                self.state not in ('RECOVER_SEARCH', 'SEARCH')):
+            if self.state == 'AVOID_LEFT':
+                # Never override an active collision-avoidance turn.
+                pass
+            else:
+                self.recovery_failed(now)
+                return
+
         if self.state == 'SEARCH':
             if front_close:
                 self.start_avoid(now)
@@ -355,6 +420,7 @@ class WallCoverage(Node):
             self.target_distance = self.first_wall_distance
             self.active_distance = self.first_wall_distance
             self.wall_missing_since = None
+            self.recovery_started = None
             self.recent_path.clear()
             self.begin_lap(now)
             self.get_logger().info('FOLLOW: initial wall confirmed')
@@ -366,28 +432,73 @@ class WallCoverage(Node):
             blocked = (self.front < self.front_resume or
                        self.front_right < self.front_right_stop + 0.05)
             if blocked:
-                self.move(0, self.avoid_turn_speed)
+                # If partly clear, creep while turning LEFT. With a truly
+                # close obstacle, rotate on the spot instead of driving in.
+                if (self.front >= 0.35 and
+                        self.front_right >= 0.32 and
+                        self.right_near is not None and
+                        self.right_near >= self.right_rotation_stop):
+                    self.move(self.avoid_creep_speed, self.avoid_turn_speed)
+                else:
+                    self.move(0, self.avoid_turn_speed)
                 return
             prior = self.resume_after_avoid
-            # Do not resume an unsafe clockwise rotation automatically.
-            self.state = 'FOLLOW' if prior == 'CORNER_RIGHT' else prior
+            # A brief front obstruction during a right turn is not a new
+            # corner attempt. Resume recovery with the ORIGINAL timeout.
+            self.state = prior
             self.avoid_started = None
-            self.wall_missing_since = now
+            if prior != 'CORNER_RIGHT':
+                self.wall_missing_since = now
             self.move(0, 0)
             return
 
-        if self.state == 'CORNER_RIGHT':
-            # A front obstacle always takes priority; close right-side
-            # objects stop clockwise rotation instead of forcing LEFT/RIGHT flips.
-            if self.front < self.front_stop:
+        if self.state == 'RECOVER_SEARCH':
+            # Search for any sufficiently confirmed right wall, including
+            # short sections. Do not resume following until it is oriented
+            # reasonably close to the robot's heading.
+            reacquired = (wall_seen and
+                          abs(wall[1]) <= self.corner_reacquire_angle)
+            self.reacquire_ticks = self.reacquire_ticks + 1 if reacquired else 0
+            if self.reacquire_ticks >= self.corner_confirm_ticks:
+                self.state = 'FOLLOW'
+                self.last_corner_recovery = now
+                self.wall_missing_since = None
+                self.wall_stable_since = now
+                self.recovery_search_started = None
+                self.reacquire_ticks = 0
+                self.get_logger().info('FOLLOW: wall found during slow search')
+                self.move(0, 0)
+                return
+            if front_close:
                 self.start_avoid(now)
                 return
-            if ((self.front_right is not None and self.front_right < self.right_rotation_stop) or
-                    (self.right_near is not None and self.right_near < self.right_rotation_stop)):
-                self.finish('STOP: insufficient clearance for right rotation')
+            if (self.recovery_search_started is not None and
+                    now - self.recovery_search_started >= self.recovery_search_timeout):
+                self.recovery_failed(now)
                 return
-            if now - self.corner_started >= self.corner_timeout:
-                self.finish('STOP: right corner not recovered within 10 seconds')
+            # Forward only if front/front-right are sufficiently clear.
+            if (self.front >= self.corner_forward_clearance and
+                    self.front_right >= self.corner_front_right_clearance):
+                self.move(self.recovery_search_speed, 0)
+            else:
+                self.move(0, 0)
+            return
+
+        if self.state == 'CORNER_RIGHT':
+            if (self.recovery_started is not None and
+                    now - self.recovery_started >= self.corner_timeout):
+                self.recovery_failed(now)
+                return
+            # A frontal obstacle cannot be driven through. Turn LEFT in place.
+            if front_close:
+                self.start_avoid(now)
+                return
+            # Clockwise rotation can sweep the robot into a close right-side
+            # object. Stop instead of moving blindly into that object.
+            if (self.front_right < self.right_rotation_stop or
+                    (self.right_near is not None and
+                     self.right_near < self.right_rotation_stop)):
+                self.finish('STOP: unsafe right-side clearance during recovery')
                 return
             recovered = (wall_seen and
                          abs(wall[1]) <= self.corner_reacquire_angle)
@@ -396,12 +507,13 @@ class WallCoverage(Node):
                 self.state = 'FOLLOW'
                 self.wall_missing_since = None
                 self.last_corner_recovery = now
+                self.wall_stable_since = now
                 self.corner_started = None
                 self.reacquire_ticks = 0
-                self.get_logger().info('FOLLOW: right corner recovered')
+                self.get_logger().info('FOLLOW: right corner recovered; steering stabilized')
                 self.move(0, 0)
                 return
-            self.move(0, -self.corner_turn_speed)
+            self.corner_motion()
             return
 
         if front_close:
@@ -419,6 +531,7 @@ class WallCoverage(Node):
                 self.begin_lap(now)
 
         if not wall_seen:
+            self.wall_stable_since = None
             if self.wall_missing_since is None:
                 self.wall_missing_since = now
             if now - self.wall_missing_since < self.corner_grace:
@@ -429,6 +542,13 @@ class WallCoverage(Node):
             self.start_corner(now)
             return
         self.wall_missing_since = None
+        if self.recovery_started is not None:
+            if self.wall_stable_since is None:
+                self.wall_stable_since = now
+            elif now - self.wall_stable_since >= self.recovery_reset_seconds:
+                self.recovery_started = None
+                self.wall_stable_since = None
+                self.get_logger().info('Wall stable for 2s; recovery timer reset')
 
         # Controller: signed line heading + distance correction.
         distance_error = self.active_distance - wall[0]
