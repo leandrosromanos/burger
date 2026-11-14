@@ -1,0 +1,17 @@
+import rclpy #epikoinonia python me ROS2
+from rclpy.node import Node #node dimiourgei to diko mas kombo
+from nav_msgs.msg import OccupancyGrid #tipos minimatos pou periexei xarti
+
+class Explorer(Node): #dimiourgia komvou
+
+    def __init__(self):
+        super().__init__('my_explorer')
+
+        self.subscription = self.create_subscription(
+            OccupancyGrid,
+            '/map',
+            self.map_callback,
+            10
+        )
+
+        self.get_logger().info('Περιμένω χάρτη...')
