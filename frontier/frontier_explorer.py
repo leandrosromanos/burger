@@ -4,6 +4,7 @@ Never publishes cmd_vel. Run without teleop or the reactive avoidance node.
 The grid model is conservative; Nav2 validates paths and handles local obstacles.
 """
 import math
+import signal
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -85,10 +86,11 @@ class Grid:
 def plan_frontiers(grid, robot_xy, clearance=.18, standoff=.35):
     """Return reachable observation poses and counts, never unknown-space goals.
 
-    Paths are 4-connected in free space eroded by clearance. Frontier components
-    use the occupied-inflated map; a short known-space BFS connects their cells
-    to safe observation positions. Small frontiers are retained, not silently
-    treated as completed. Goal and path inflation treat unknown as blocked.
+    Robot paths are 4-connected in free space eroded by clearance. Frontier
+    detection uses the ORIGINAL free map: a frontier is a sensor observation
+    target, not a position the robot must physically occupy. Only observation
+    poses and robot paths need footprint clearance. A short free-space search
+    connects frontiers to safe, reachable observation positions.
     """
     a, r = grid.cells, grid.resolution
     free, unknown = (a >= 0) & (a <= 25), a < 0
@@ -102,15 +104,14 @@ def plan_frontiers(grid, robot_xy, clearance=.18, standoff=.35):
     frontier = free & adjacent
     # A half diagonal accounts conservatively for occupied cell area.
     inflation = clearance/r + math.sqrt(.5)
-    loose = free & ~dilate((a > 25), inflation, outside=True)
     safe = free & ~dilate(~free, inflation, outside=True)
     start = grid.cell(*robot_xy)
     distance = flood(safe, start)
     if not np.any(distance >= 0):
         return [], {'reason': 'ROBOT_NOT_IN_SAFE_FREE_SPACE', 'reachable': 0,
                     'unresolved': int(frontier.sum())}
-    loose_dist = flood(loose, start)
-    reachable_frontier = frontier & (loose_dist >= 0)
+    free_dist = flood(free, start)
+    reachable_frontier = frontier & (free_dist >= 0)
     groups = components(reachable_frontier)
     goal_mask = (distance >= 0) & ~dilate(unknown, standoff/r+math.sqrt(.5), outside=True)
     goals, unresolved = [], 0
@@ -138,7 +139,7 @@ def plan_frontiers(grid, robot_xy, clearance=.18, standoff=.35):
                     continue
                 for dy, dx in NEIGHBOURS:
                     cell = yy, xx = y+dy, x+dx
-                    if (0 <= yy < h and 0 <= xx < w and loose[yy, xx]
+                    if (0 <= yy < h and 0 <= xx < w and free[yy, xx]
                             and cell not in seen):
                         seen.add(cell)
                         queue.append((cell, steps+1))
@@ -152,8 +153,13 @@ def plan_frontiers(grid, robot_xy, clearance=.18, standoff=.35):
             goals.append((score, gx, gy, yaw))
     goals.sort()
     return goals, {'reason': 'OK', 'reachable': len(groups),
-                   'unresolved': unresolved,
+                   'unresolved': unresolved, 'total_frontier_cells': int(frontier.sum()),
                    'disconnected_cells': int((frontier & ~reachable_frontier).sum())}
+
+
+def completion_candidate(stats):
+    """Never report success solely because inflation or connectivity hid goals."""
+    return stats.get('reason') == 'OK' and stats.get('total_frontier_cells', -1) == 0
 
 
 class GoalHistory:
@@ -217,7 +223,7 @@ def main(args=None):
             self.goal_pub = self.create_publisher(PoseStamped, '~/goal', 10)
             self.pause_service = self.create_service(SetBool, '~/pause', self.pause)
             self.history = GoalHistory()
-            self.handle = self.pending = self.result_future = None
+            self.nav_goal_handle = self.pending = self.result_future = None
             self.target = None
             self.cancel_reason = None
             self.cancel_sent = False
@@ -294,16 +300,16 @@ def main(args=None):
             return response
 
         def busy(self):
-            return self.pending is not None or self.handle is not None
+            return self.pending is not None or self.nav_goal_handle is not None
 
         def cancel(self, reason):
             if not self.busy():
                 return
             if self.cancel_reason is None:
                 self.cancel_reason = reason
-            if self.handle is not None and not self.cancel_sent:
+            if self.nav_goal_handle is not None and not self.cancel_sent:
                 self.cancel_sent = True
-                self.handle.cancel_goal_async().add_done_callback(self.cancel_ack)
+                self.nav_goal_handle.cancel_goal_async().add_done_callback(self.cancel_ack)
                 self.status('CANCELING: ' + self.cancel_reason)
 
         def cancel_ack(self, future):
@@ -330,7 +336,7 @@ def main(args=None):
                 self.next_plan = time.monotonic()+3
                 self.status('REJECTED: will select another goal')
                 return
-            self.handle = handle
+            self.nav_goal_handle = handle
             self.result_future = handle.get_result_async()
             self.result_future.add_done_callback(self.goal_result)
             if self.cancel_reason is not None or self.stopping or self.paused:
@@ -348,7 +354,7 @@ def main(args=None):
             except Exception as exc:
                 self.fault = True
                 self.status('FAULT: result unknown; stop Nav2: ' + str(exc))
-            self.handle = self.result_future = self.target = None
+            self.nav_goal_handle = self.result_future = self.target = None
             self.cancel_reason = None
             self.cancel_sent = False
             self.next_plan = time.monotonic()+3
@@ -396,7 +402,7 @@ def main(args=None):
                 if self.pending is not None and now-self.start_time > 10:
                     self.cancel('Goal acceptance delayed')
                     self.status('WAIT_SERVER: no new goal until previous acceptance is resolved')
-                if self.handle is not None:
+                if self.nav_goal_handle is not None:
                     if math.dist(xy, self.progress_xy) >= .12:
                         self.progress_xy, self.last_progress = xy, now
                     if now-self.start_time > self.param('goal_timeout'):
@@ -416,13 +422,13 @@ def main(args=None):
                 self.empty_sequences.clear()
                 self.status('BLOCKED: ' + stats['reason'] + '; check map, pose and clearance')
                 return
-            if stats['reachable'] == 0:
+            if completion_candidate(stats):
                 if self.empty_since is None:
                     self.empty_since = now
                 self.empty_sequences.add(self.map_seq)
                 if now-self.empty_since >= 15 and len(self.empty_sequences) >= 3:
-                    self.status('COMPLETE_REACHABLE: no reachable frontiers under current clearance; '
-                                f"disconnected frontier cells={stats['disconnected_cells']}. Save and inspect map.")
+                    self.status('COMPLETE_OBSERVED: no frontiers remain in current map. '
+                                'Save and inspect map; this is not a guarantee of full physical coverage.')
                 else:
                     self.status('VERIFYING: waiting for fresh maps before declaring completion')
                 # Keep watching: newly appearing frontiers automatically resume work.
@@ -433,13 +439,26 @@ def main(args=None):
                 if self.history.allowed(goal[1:3], now):
                     self.send(goal, xy, now)
                     return
-            self.status('UNRESOLVED: frontiers remain, but viewpoints are unsafe, cooling down '
-                        'or exhausted after 3 visits. Not complete; inspect RViz.')
+            self.status(f"UNRESOLVED: frontier_cells={stats['total_frontier_cells']}, "
+                        f"disconnected_cells={stats['disconnected_cells']}, "
+                        f"groups_without_viewpoint={stats['unresolved']}, candidates={len(goals)}. "
+                        'Unsafe, cooling down or exhausted viewpoints; NOT complete.')
 
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     node = Explorer()
+    # Avoid raising KeyboardInterrupt inside a pybind subscription conversion.
+    # Signal handlers only set a flag; cancellation runs in normal executor code.
+    stop_requested = False
+
+    def request_stop(signum, frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    old_sigint = signal.signal(signal.SIGINT, request_stop)
+    old_sigterm = signal.signal(signal.SIGTERM, request_stop)
     try:
-        rclpy.spin(node)
+        while rclpy.ok() and not stop_requested:
+            rclpy.spin_once(node, timeout_sec=.2)
     except KeyboardInterrupt:
         pass
     finally:
@@ -456,6 +475,8 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
 
 
 if __name__ == '__main__':
