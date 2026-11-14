@@ -2,7 +2,7 @@ import rclpy #epikoinonia python me ROS2
 from rclpy.node import Node #node dimiourgei to diko mas kombo
 from nav_msgs.msg import OccupancyGrid #tipos minimatos pou periexei xarti
 
-class Explorer(Node): #dimiourgia komvou
+class Explorer(Node):
 
     def __init__(self):
         super().__init__('my_explorer')
@@ -16,8 +16,21 @@ class Explorer(Node): #dimiourgia komvou
 
         self.get_logger().info('Waiting for map...')
 
-        total_cells = len(msg.data)
+    def map_callback(self, msg):
+        width = msg.info.width
+        height = msg.info.height
+        resolution = msg.info.resolution
 
+        width_meters = width * resolution
+        height_meters = height * resolution
+
+        self.get_logger().info(
+            f'Map: {width} x {height} cells | '
+            f'Resolution: {resolution:.3f} m/cell | '
+            f'Dimensions: {width_meters:.2f} x {height_meters:.2f} m'
+        )
+
+        total_cells = len(msg.data)
         unknown_cells = 0
 
         for value in msg.data:
@@ -31,20 +44,6 @@ class Explorer(Node): #dimiourgia komvou
             f'Known: {known_cells} | '
             f'Unknown: {unknown_cells}'
         )
-
-        def map_callback(self, msg):
-            width = msg.info.width
-            height = msg.info.height
-            resolution = msg.info.resolution
-
-            width_meters = width * resolution
-            height_meters = height * resolution
-
-            self.get_logger().info(
-                f'Map: {width} × {height} κελιά | '
-                f'Resolution: {resolution:.3f} m/κελί | '
-                f'Dimentions: {width_meters:.2f} × {height_meters:.2f} m'
-            )
 
 def main(args=None):
 
