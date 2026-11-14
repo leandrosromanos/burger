@@ -16,8 +16,8 @@ def wrap_angle(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
 
 
 class WallCoverage(Node):
@@ -26,7 +26,7 @@ class WallCoverage(Node):
         super().__init__('wall_coverage')
 
         # =====================================
-        # MOVEMENT PARAMETERS
+        # ROBOT MOVEMENT
         # =====================================
         self.forward_speed = 0.075
         self.cautious_speed = 0.045
@@ -37,7 +37,7 @@ class WallCoverage(Node):
         self.front_right_stop = 0.23
 
         # =====================================
-        # WALL FOLLOWING
+        # RIGHT WALL FOLLOWING
         # =====================================
         self.first_wall_distance = 0.36
         self.wall_acquire_range = 0.70
@@ -49,57 +49,53 @@ class WallCoverage(Node):
         self.wall_kp = 0.9
         self.heading_kp = 0.65
 
-        self.max_right_steer = 0.10
+        # Increased right turn capability
+        self.max_right_steer = 0.24
         self.max_left_steer = 0.20
 
-        self.wall_lost_timeout = 15.0
-
         # =====================================
-        # NEW: WALL CLASSIFICATION
+        # WALL DETECTION
         # =====================================
+        self.wall_sector_min = -145
+        self.wall_sector_max = -25
 
-        # Inspect the right-side LiDAR sector.
-        self.wall_sector_min = -125
-        self.wall_sector_max = -55
-
-        # Reject detected straight segments shorter
-        # than 35 cm.
         self.min_wall_length = 0.35
-
-        # Maximum RMS line-fitting error.
         self.max_line_error = 0.035
-
-        # Maximum separation between consecutive
-        # points belonging to one segment.
         self.max_point_gap = 0.12
-
-        # Minimum LiDAR points in a segment.
         self.min_wall_points = 8
 
-        # Required consecutive compatible scans.
         self.confirmation_scans = 5
 
-        # Line orientation limits.
         self.acquire_angle_limit = math.radians(30)
-        self.follow_angle_limit = math.radians(45)
+        self.follow_angle_limit = math.radians(70)
 
-        # Maximum changes between consecutive scans
-        # when confirming the same candidate.
         self.stability_distance = 0.12
         self.stability_angle = math.radians(20)
 
-        # Detect segments within this range.
         self.max_detection_range = 2.5
 
         # =====================================
-        # SAFETY PARAMETERS
+        # RIGHT CORNER RECOVERY
+        # =====================================
+        self.corner_grace_time = 0.5
+        self.corner_turn_speed = 0.20
+
+        # Enough time for approximately
+        # a 90-degree right turn.
+        self.corner_timeout = 9.0
+
+        self.corner_reacquire_angle = math.radians(40)
+
+        self.corner_started = None
+        self.wall_missing_since = None
+
+        # =====================================
+        # SAFETY
         # =====================================
         self.scan_timeout = 0.7
         self.odom_timeout = 0.7
         self.max_avoid_seconds = 16.0
 
-        # Small-loop watchdog: approximately
-        # 25 seconds at the 10 Hz control rate.
         self.loop_window_ticks = 250
         self.loop_max_span = 1.40
         self.loop_return_radius = 0.35
@@ -110,6 +106,7 @@ class WallCoverage(Node):
         # =====================================
         self.lap_leave_radius = 0.90
         self.lap_return_radius = 0.40
+
         self.lap_heading_tolerance = math.radians(40)
 
         self.min_lap_distance = 3.0
@@ -128,43 +125,51 @@ class WallCoverage(Node):
         self.pose = None
         self.previous_xy = None
 
-        # Fitted wall:
-        # (perpendicular_distance, angle,
-        #  segment_length, fitting_error)
         self.wall_candidate = None
         self.previous_candidate = None
+        self.confirmed_wall = None
 
         self.wall_confirmations = 0
-        self.confirmed_wall = None
 
         # =====================================
         # STATE MACHINE
         # =====================================
-        self.state = 'SEARCH'
-        self.resume_after_avoid = 'SEARCH'
+        # SEARCH
+        # FOLLOW
+        # AVOID_LEFT
+        # CORNER_RIGHT
+        # SHIFT_INWARD
+        # DONE
 
+        self.state = 'SEARCH'
+
+        self.resume_after_avoid = 'SEARCH'
         self.avoid_started = None
-        self.wall_missing_since = None
 
         self.active_distance = self.first_wall_distance
         self.target_distance = self.first_wall_distance
 
+        # =====================================
+        # LAP VARIABLES
+        # =====================================
         self.lap_count = 0
         self.lap_origin = None
+
         self.lap_distance = 0.0
         self.lap_start_time = None
 
         self.lap_seen_ticks = 0
         self.lap_total_ticks = 0
+
         self.left_lap_origin = False
 
-        # Recent trajectory for loop detection.
+        # Store recent robot positions.
         self.recent_path = deque(
             maxlen=self.loop_window_ticks
         )
 
         # =====================================
-        # ROS INTERFACES
+        # ROS SUBSCRIPTIONS
         # =====================================
         self.create_subscription(
             LaserScan,
@@ -180,8 +185,7 @@ class WallCoverage(Node):
             qos_profile_sensor_data
         )
 
-        # Check the actual /cmd_vel type.
-        # This version assumes TwistStamped.
+        # Assumes /cmd_vel uses TwistStamped.
         self.publisher = self.create_publisher(
             TwistStamped,
             '/cmd_vel',
@@ -191,11 +195,12 @@ class WallCoverage(Node):
         self.create_timer(0.1, self.control)
 
         self.get_logger().info(
-            'Started: geometric wall validation enabled.'
+            'Wall coverage started: '
+            'right-corner recovery enabled.'
         )
 
     # =========================================
-    # BASIC LIDAR SECTOR
+    # READ A LIDAR SECTOR
     # =========================================
     @staticmethod
     def sector(scan, low, high):
@@ -203,7 +208,7 @@ class WallCoverage(Node):
         valid = []
         clear = 0
 
-        for i, d in enumerate(scan.ranges):
+        for i, distance in enumerate(scan.ranges):
 
             angle = math.degrees(
                 scan.angle_min +
@@ -216,12 +221,12 @@ class WallCoverage(Node):
                 continue
 
             if (
-                math.isfinite(d)
-                and scan.range_min <= d <= scan.range_max
+                math.isfinite(distance)
+                and scan.range_min <= distance <= scan.range_max
             ):
-                valid.append(d)
+                valid.append(distance)
 
-            elif math.isinf(d) and d > 0:
+            elif math.isinf(distance) and distance > 0:
                 clear += 1
 
         if valid:
@@ -233,7 +238,7 @@ class WallCoverage(Node):
         return None
 
     # =========================================
-    # NEW: FIT STRAIGHT LINE TO POINTS
+    # FIT A LINE TO LIDAR POINTS
     # =========================================
     @staticmethod
     def fit_line(points):
@@ -243,15 +248,17 @@ class WallCoverage(Node):
         if n < 2:
             return None
 
-        mx = sum(p[0] for p in points) / n
-        my = sum(p[1] for p in points) / n
+        mx = sum(x for x, y in points) / n
+        my = sum(y for x, y in points) / n
 
         sxx = sum(
-            (x - mx) ** 2 for x, y in points
+            (x - mx) ** 2
+            for x, y in points
         ) / n
 
         syy = sum(
-            (y - my) ** 2 for x, y in points
+            (y - my) ** 2
+            for x, y in points
         ) / n
 
         sxy = sum(
@@ -259,7 +266,6 @@ class WallCoverage(Node):
             for x, y in points
         ) / n
 
-        # Principal direction of the points.
         angle = 0.5 * math.atan2(
             2 * sxy,
             sxx - syy
@@ -268,8 +274,7 @@ class WallCoverage(Node):
         tx = math.cos(angle)
         ty = math.sin(angle)
 
-        # Orient tangent toward the robot's
-        # positive x direction.
+        # Orient line direction forward.
         if tx < 0:
             tx = -tx
             ty = -ty
@@ -285,22 +290,20 @@ class WallCoverage(Node):
             dy = y - my
 
             along = dx * tx + dy * ty
-
             perpendicular = -dx * ty + dy * tx
 
             projections.append(along)
             errors.append(perpendicular ** 2)
 
         length = (
-            max(projections) - min(projections)
+            max(projections) -
+            min(projections)
         )
 
         rms_error = math.sqrt(
             sum(errors) / n
         )
 
-        # Distance from the robot origin to
-        # the infinite fitted line.
         distance = abs(
             -mx * ty + my * tx
         )
@@ -313,7 +316,7 @@ class WallCoverage(Node):
         )
 
     # =========================================
-    # NEW: DETECT RIGHT-WALL CANDIDATES
+    # DETECT POSSIBLE RIGHT WALL
     # =========================================
     def detect_right_wall(self, scan):
 
@@ -323,7 +326,7 @@ class WallCoverage(Node):
 
         measurements = []
 
-        for i, d in enumerate(scan.ranges):
+        for i, distance in enumerate(scan.ranges):
 
             angle = wrap_angle(
                 scan.angle_min +
@@ -340,9 +343,9 @@ class WallCoverage(Node):
                 continue
 
             if (
-                not math.isfinite(d)
-                or d < scan.range_min
-                or d > min(
+                not math.isfinite(distance)
+                or distance < scan.range_min
+                or distance > min(
                     scan.range_max,
                     self.max_detection_range
                 )
@@ -350,61 +353,13 @@ class WallCoverage(Node):
                 measurements.append(None)
                 continue
 
-            x = d * math.cos(angle)
-            y = d * math.sin(angle)
+            x = distance * math.cos(angle)
+            y = distance * math.sin(angle)
 
-            measurements.append(
-                (degrees, x, y)
-            )
+            measurements.append((x, y))
 
-        # Sort by angle in case a scan crosses
-        # the angular wrap boundary.
-        measurements = sorted(
-            measurements,
-            key=lambda p: (
-                p is None,
-                p[0] if p is not None else 0
-            )
-        )
-
-        # Use actual angular order for valid
-        # points. Invalid rays separate segments.
-        # Rebuild the original ordered sequence.
-        measurements = []
-
-        for i, d in enumerate(scan.ranges):
-
-            angle = wrap_angle(
-                scan.angle_min +
-                i * scan.angle_increment
-            )
-
-            degrees = math.degrees(angle)
-
-            if not (
-                self.wall_sector_min
-                <= degrees
-                <= self.wall_sector_max
-            ):
-                continue
-
-            if (
-                not math.isfinite(d)
-                or d < scan.range_min
-                or d > min(
-                    scan.range_max,
-                    self.max_detection_range
-                )
-            ):
-                measurements.append(None)
-            else:
-                measurements.append(
-                    (
-                        d * math.cos(angle),
-                        d * math.sin(angle)
-                    )
-                )
-
+        # Divide LiDAR points into continuous
+        # clusters using point-to-point gaps.
         for point in measurements:
 
             if point is None:
@@ -450,12 +405,15 @@ class WallCoverage(Node):
 
             distance, heading, length, error = result
 
+            # Long enough to be a wall candidate?
             if length < self.min_wall_length:
                 continue
 
+            # Straight enough?
             if error > self.max_line_error:
                 continue
 
+            # Reasonable orientation?
             if abs(heading) > self.follow_angle_limit:
                 continue
 
@@ -467,18 +425,19 @@ class WallCoverage(Node):
         if not candidates:
             return None
 
-        # Prefer nearer, more parallel segments.
+        # Prefer nearby, parallel surfaces.
         candidates.sort(
-            key=lambda c: (
-                c[0] + 0.20 * abs(c[1]),
-                -c[2]
+            key=lambda candidate: (
+                candidate[0] +
+                0.20 * abs(candidate[1]),
+                -candidate[2]
             )
         )
 
         return candidates[0]
 
     # =========================================
-    # NEW: CONFIRM WALL OVER MULTIPLE SCANS
+    # CONFIRM DETECTED WALL
     # =========================================
     def update_wall_confirmation(self, candidate):
 
@@ -521,6 +480,7 @@ class WallCoverage(Node):
                 )
 
             else:
+
                 self.wall_confirmations = 1
 
         self.previous_candidate = candidate
@@ -530,11 +490,12 @@ class WallCoverage(Node):
             >= self.confirmation_scans
         ):
             self.confirmed_wall = candidate
+
         else:
             self.confirmed_wall = None
 
     # =========================================
-    # SENSOR CALLBACKS
+    # LIDAR CALLBACK
     # =========================================
     def on_scan(self, scan):
 
@@ -552,6 +513,9 @@ class WallCoverage(Node):
 
         self.last_scan = time.monotonic()
 
+    # =========================================
+    # ODOMETRY CALLBACK
+    # =========================================
     def on_odom(self, msg):
 
         p = msg.pose.pose.position
@@ -563,6 +527,7 @@ class WallCoverage(Node):
         )
 
         self.pose = (p.x, p.y, yaw)
+
         self.last_odom = time.monotonic()
 
         if (
@@ -581,7 +546,7 @@ class WallCoverage(Node):
         self.previous_xy = (p.x, p.y)
 
     # =========================================
-    # VELOCITY COMMAND
+    # SEND VELOCITY
     # =========================================
     def move(self, linear, angular):
 
@@ -599,12 +564,13 @@ class WallCoverage(Node):
         self.publisher.publish(cmd)
 
     # =========================================
-    # LAP MANAGEMENT
+    # START A LAP
     # =========================================
     def begin_lap(self, now):
 
         self.lap_origin = self.pose
         self.lap_distance = 0.0
+
         self.lap_start_time = now
 
         self.lap_seen_ticks = 0
@@ -613,10 +579,13 @@ class WallCoverage(Node):
         self.left_lap_origin = False
 
         self.get_logger().info(
-            f'Lap {self.lap_count + 1} started; '
-            f'gap {self.target_distance:.2f} m'
+            f'Lap {self.lap_count + 1} started. '
+            f'Target gap: {self.target_distance:.2f} m'
         )
 
+    # =========================================
+    # CHECK LAP COMPLETION
+    # =========================================
     def check_lap(self, now, wall_seen):
 
         if self.lap_origin is None:
@@ -675,22 +644,33 @@ class WallCoverage(Node):
             self.max_wall_distance + 1e-6
         ):
 
+            self.get_logger().info(
+                'Maximum target distance reached. STOP.'
+            )
+
             self.state = 'DONE'
             self.move(0, 0)
             return
 
         self.target_distance = next_target
+
         self.state = 'SHIFT_INWARD'
 
         self.lap_origin = None
 
+        self.get_logger().info(
+            f'Increasing right-wall gap to '
+            f'{next_target:.2f} m'
+        )
+
     # =========================================
-    # NEW: SMALL-LOOP DETECTOR
+    # DETECT SMALL REPEATING LOOPS
     # =========================================
     def check_small_loop(self):
 
         if self.state not in (
-            'FOLLOW', 'SHIFT_INWARD'
+            'FOLLOW',
+            'SHIFT_INWARD'
         ):
             self.recent_path.clear()
             return False
@@ -746,27 +726,37 @@ class WallCoverage(Node):
             and returned
             and travel >= self.loop_min_travel
         ):
+
             self.get_logger().warning(
-                'Possible small obstacle loop: STOP'
+                'Possible small obstacle loop. STOP.'
             )
+
             return True
 
         return False
 
     # =========================================
-    # AVOIDANCE HELPERS
+    # START LEFT AVOIDANCE
     # =========================================
     def start_avoidance(self, now):
 
         self.resume_after_avoid = self.state
+
         self.state = 'AVOID_LEFT'
 
         self.avoid_started = now
 
-        self.move(0, self.left_turn_speed)
+        self.get_logger().info(
+            'Obstacle ahead: turning LEFT.'
+        )
+
+        self.move(
+            0,
+            self.left_turn_speed
+        )
 
     # =========================================
-    # MAIN CONTROLLER
+    # MAIN CONTROL LOOP
     # =========================================
     def control(self):
 
@@ -776,7 +766,9 @@ class WallCoverage(Node):
 
         now = time.monotonic()
 
-        # Stop when sensors are stale.
+        # =====================================
+        # CHECK SENSOR VALIDITY
+        # =====================================
         if (
             self.last_scan is None
             or self.last_odom is None
@@ -788,6 +780,9 @@ class WallCoverage(Node):
             self.move(0, 0)
             return
 
+        # =====================================
+        # FRONT OBSTACLE DETECTION
+        # =====================================
         front_close = (
             self.front < self.front_stop
             or (
@@ -799,6 +794,7 @@ class WallCoverage(Node):
 
         wall = self.confirmed_wall
 
+        # A wall suitable for initial following.
         wall_acquirable = (
             wall is not None
             and wall[0] <= self.wall_acquire_range
@@ -806,6 +802,7 @@ class WallCoverage(Node):
                 <= self.acquire_angle_limit
         )
 
+        # A wall suitable for continued tracking.
         wall_seen = (
             wall is not None
             and wall[0] <= max(
@@ -817,7 +814,7 @@ class WallCoverage(Node):
         )
 
         # =====================================
-        # SEARCH: MOVE STRAIGHT
+        # STATE 1: SEARCH
         # =====================================
         if self.state == 'SEARCH':
 
@@ -845,21 +842,24 @@ class WallCoverage(Node):
                 self.begin_lap(now)
 
                 self.get_logger().info(
-                    'Confirmed right wall: '
-                    f'distance={wall[0]:.2f} m, '
-                    f'length={wall[2]:.2f} m, '
-                    f'angle={math.degrees(wall[1]):.1f} deg'
+                    'Confirmed right wall. '
+                    f'Distance={wall[0]:.2f} m, '
+                    f'Length={wall[2]:.2f} m, '
+                    f'Angle={math.degrees(wall[1]):.1f} deg'
                 )
 
             else:
 
+                # No confirmed wall:
+                # continue searching straight.
                 self.move(
-                    self.forward_speed, 0
+                    self.forward_speed,
+                    0
                 )
                 return
 
         # =====================================
-        # AVOID LEFT
+        # STATE 2: AVOID LEFT
         # =====================================
         if self.state == 'AVOID_LEFT':
 
@@ -870,7 +870,7 @@ class WallCoverage(Node):
             ):
 
                 self.get_logger().warning(
-                    'Avoidance timeout: STOP'
+                    'Avoidance timeout. STOP.'
                 )
 
                 self.state = 'DONE'
@@ -889,26 +889,88 @@ class WallCoverage(Node):
             if still_blocked:
 
                 self.move(
-                    0, self.left_turn_speed
+                    0,
+                    self.left_turn_speed
                 )
                 return
 
+            # Return to the previous state.
             self.state = self.resume_after_avoid
+
             self.avoid_started = None
 
             self.move(
-                self.cautious_speed, 0
+                self.cautious_speed,
+                0
             )
             return
 
         # =====================================
-        # FOLLOW SAFETY
+        # STATE 3: CORNER RIGHT
+        # =====================================
+        if self.state == 'CORNER_RIGHT':
+
+            # Safety priority.
+            if front_close:
+
+                self.start_avoidance(now)
+                return
+
+            # Check whether a suitable wall
+            # has been recovered.
+            recovered = (
+                wall_seen
+                and abs(wall[1])
+                    <= self.corner_reacquire_angle
+            )
+
+            if recovered:
+
+                self.state = 'FOLLOW'
+
+                self.wall_missing_since = None
+                self.corner_started = None
+
+                self.get_logger().info(
+                    'Right wall recovered after corner.'
+                )
+
+                self.move(0, 0)
+                return
+
+            # Prevent endless right rotation.
+            if (
+                self.corner_started is not None
+                and now - self.corner_started
+                    >= self.corner_timeout
+            ):
+
+                self.get_logger().warning(
+                    'Right corner recovery failed. STOP.'
+                )
+
+                self.state = 'DONE'
+                self.move(0, 0)
+                return
+
+            # Turn RIGHT in place.
+            self.move(
+                0,
+                -self.corner_turn_speed
+            )
+            return
+
+        # =====================================
+        # FRONT SAFETY DURING FOLLOWING
         # =====================================
         if front_close:
 
             self.start_avoidance(now)
             return
 
+        # =====================================
+        # LOOP DETECTION
+        # =====================================
         if self.check_small_loop():
 
             self.state = 'DONE'
@@ -916,70 +978,88 @@ class WallCoverage(Node):
             return
 
         # =====================================
-        # INCREASE WALL CLEARANCE
+        # STATE 4: SHIFT INWARD
         # =====================================
         if self.state == 'SHIFT_INWARD':
 
             self.active_distance = min(
                 self.target_distance,
-                self.active_distance +
-                self.offset_ramp
+                self.active_distance
+                + self.offset_ramp
             )
 
             if (
-                self.active_distance >=
-                self.target_distance - 1e-6
+                self.active_distance
+                >= self.target_distance - 1e-6
             ):
 
                 self.state = 'FOLLOW'
+
                 self.begin_lap(now)
 
         # =====================================
-        # LOST WALL
+        # WALL LOST: RIGHT CORNER RECOVERY
         # =====================================
         if not wall_seen:
 
             if self.wall_missing_since is None:
                 self.wall_missing_since = now
 
-            if (
-                now - self.wall_missing_since >
-                self.wall_lost_timeout
-            ):
-
-                self.get_logger().warning(
-                    'Confirmed wall lost: STOP'
-                )
-
-                self.state = 'DONE'
-
-                self.move(0, 0)
-                return
-
-            self.move(
-                self.cautious_speed, 0
+            missing_duration = (
+                now - self.wall_missing_since
             )
 
-            if self.state == 'FOLLOW':
-                self.check_lap(now, False)
+            # Brief disappearance:
+            # move straight slowly.
+            if (
+                missing_duration
+                < self.corner_grace_time
+            ):
 
+                self.move(
+                    self.cautious_speed,
+                    0
+                )
+
+                if self.state == 'FOLLOW':
+                    self.check_lap(now, False)
+
+                return
+
+            # Wall has disappeared long enough.
+            # Attempt a RIGHT turn.
+            self.state = 'CORNER_RIGHT'
+
+            self.corner_started = now
+
+            self.recent_path.clear()
+
+            self.get_logger().info(
+                'Right wall lost: '
+                'attempting RIGHT corner recovery.'
+            )
+
+            self.move(
+                0,
+                -self.corner_turn_speed
+            )
             return
 
         self.wall_missing_since = None
 
         # =====================================
-        # IMPROVED WALL CONTROLLER
+        # STATE 5: NORMAL WALL FOLLOWING
         # =====================================
         distance = wall[0]
         wall_angle = wall[1]
 
-        # Closer than target -> turn left.
-        # Farther than target -> turn right.
+        # Right wall too close -> steer left.
+        # Right wall too far -> steer right.
         distance_error = (
             self.active_distance - distance
         )
 
-        # Steer parallel to fitted wall.
+        # Align with wall direction.
         heading_error = wall_angle
 
         angular = (
@@ -993,16 +1073,30 @@ class WallCoverage(Node):
             self.max_left_steer
         )
 
-        if abs(angular) > 0.14:
+        # Slow down for substantial turns.
+        if angular < -0.07:
+
             speed = self.cautious_speed
+
+        elif angular > 0.14:
+
+            speed = self.cautious_speed
+
         else:
+
             speed = self.forward_speed
 
-        self.move(speed, angular)
+        self.move(
+            speed,
+            angular
+        )
 
         if self.state == 'FOLLOW':
             self.check_lap(now, True)
 
+    # =========================================
+    # STOP ROBOT
+    # =========================================
     def stop(self):
         self.move(0, 0)
 
